@@ -33,6 +33,7 @@
 
 #include "VehicleAngularVelocity.hpp"
 
+#include <lib/drivers/gyroscope/GyroFifo.hpp>
 #include <px4_platform_common/log.h>
 
 #include <uORB/topics/vehicle_imu_status.h>
@@ -832,14 +833,12 @@ void VehicleAngularVelocity::Run()
 				Vector3f angular_velocity_uncalibrated;
 				Vector3f angular_acceleration_uncalibrated;
 
-				int16_t *raw_data_array[] {sensor_fifo_data.x, sensor_fifo_data.y, sensor_fifo_data.z};
-
 				for (int axis = 0; axis < 3; axis++) {
-					// copy raw int16 sensor samples to float array for filtering
+					// Use the same applied correction as the driver's trapezoidal mean.
 					float data[FIFO_SIZE_MAX];
 
 					for (int n = 0; n < N; n++) {
-						data[n] = sensor_fifo_data.scale * raw_data_array[axis][n];
+						data[n] = gyro_fifo::sample(sensor_fifo_data, axis, n);
 					}
 
 					// save last filtered sample

@@ -1,0 +1,8 @@
+menuconfig MODULES_GPR_LEARNING
+	bool "gpr_learning"
+	default n
+	depends on !BOARD_PROTECTED
+	---help---
+		Learn a periodic body-Y gyro disturbance at the common FIFO entry.
+		One fixed physical gyro shares a single background learning task.
+		The direct driver entry is supported in a flat image.

@@ -33,9 +33,14 @@
 
 
 #include "PX4Gyroscope.hpp"
+#include "GyroFifo.hpp"
 
 #include <lib/drivers/device/Device.hpp>
 #include <lib/parameters/param.h>
+
+#if defined(CONFIG_MODULES_GPR_LEARNING)
+#include <modules/gpr_learning/GPR_Hook.hpp>
+#endif
 
 using namespace time_literals;
 
@@ -145,6 +150,13 @@ void PX4Gyroscope::updateFIFO(sensor_gyro_fifo_s &sample)
 
 	sample.device_id = _device_id;
 	sample.scale = _scale;
+	for (auto &periodic : sample.gpr_periodic) { periodic = 0.f; }
+	for (auto &axis : sample.gpr_axis) { axis = 0.f; }
+
+#if defined(CONFIG_MODULES_GPR_LEARNING)
+	gpr_process_gyro_fifo(sample);
+#endif
+
 	sample.timestamp = hrt_absolute_time();
 	_sensor_fifo_pub.publish(sample);
 
@@ -161,10 +173,14 @@ void PX4Gyroscope::updateFIFO(sensor_gyro_fifo_s &sample)
 	report.x = (0.5f * (_last_sample[0] + sample.x[N - 1]) + sum(sample.x, N - 1)) * scale;
 	report.y = (0.5f * (_last_sample[1] + sample.y[N - 1]) + sum(sample.y, N - 1)) * scale;
 	report.z = (0.5f * (_last_sample[2] + sample.z[N - 1]) + sum(sample.z, N - 1)) * scale;
+	report.x -= gyro_fifo::correction_mean(sample, 0, _last_correction[0]);
+	report.y -= gyro_fifo::correction_mean(sample, 1, _last_correction[1]);
+	report.z -= gyro_fifo::correction_mean(sample, 2, _last_correction[2]);
 
 	_last_sample[0] = sample.x[N - 1];
 	_last_sample[1] = sample.y[N - 1];
 	_last_sample[2] = sample.z[N - 1];
+	for (int axis = 0; axis < 3; ++axis) { _last_correction[axis] = gyro_fifo::correction(sample, axis, N - 1); }
 
 	report.clip_counter[0] = clipping(sample.x, N);
 	report.clip_counter[1] = clipping(sample.y, N);

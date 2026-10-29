@@ -1,0 +1,2 @@
+# Extend the default SITL configuration with the gyro learning module.
+CONFIG_MODULES_GPR_LEARNING=y

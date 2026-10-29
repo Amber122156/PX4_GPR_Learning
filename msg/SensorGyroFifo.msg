@@ -12,4 +12,7 @@ int16[32] x               # angular velocity in the FRD board frame X-axis in ra
 int16[32] y               # angular velocity in the FRD board frame Y-axis in rad/s
 int16[32] z               # angular velocity in the FRD board frame Z-axis in rad/s
 
+float32[32] gpr_periodic  # applied body Y angular velocity correction (rad/s), zero when inactive
+float32[3] gpr_axis       # body Y unit vector in FIFO board frame (R^T e_y)
+
 uint8 ORB_QUEUE_LENGTH = 4

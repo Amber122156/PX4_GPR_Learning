@@ -82,4 +82,5 @@ private:
 	uint32_t		_error_count{0};
 
 	int16_t			_last_sample[3] {};
+	float			_last_correction[3] {}; // previous applied endpoint in board-frame rad/s
 };
