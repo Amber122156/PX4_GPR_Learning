@@ -69,3 +69,9 @@ then
 	echo "No autostart ID found"
 	ekf2 start &
 fi
+
+# Start the compiled-in module; GPR_ENABLE controls learning and compensation.
+if param greater -s GPR_ENABLE -1
+then
+	gpr_learning start
+fi

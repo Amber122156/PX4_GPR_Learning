@@ -66,16 +66,6 @@ GPR_Learning *GPR_Learning::instantiate(int argc, char *argv[])
 		device_id = static_cast<uint32_t>(parsed);
 	}
 
-	if (device_id == 0) {
-		uORB::Subscription selection_sub {ORB_ID(sensor_selection)};
-		sensor_selection_s selection {};
-		if (selection_sub.copy(&selection)) { device_id = selection.gyro_device_id; }
-	}
-	if (device_id == 0) {
-		PX4_ERR("no selected gyro; start with -d <device_id>");
-		return nullptr;
-	}
-
 	auto *instance = new (std::nothrow) GPR_Learning(device_id);
 	if (instance && !instance->init()) {
 		delete instance;
@@ -127,7 +117,16 @@ void GPR_Learning::parameters_update()
 
 void GPR_Learning::process_fifo(sensor_gyro_fifo_s &fifo)
 {
-	if (should_exit() || fifo.device_id != _device_id) { return; }
+	if (should_exit()) { return; }
+
+	if (_device_id == 0) {
+		uORB::Subscription selection_sub {ORB_ID(sensor_selection)};
+		sensor_selection_s selection {};
+		if (!selection_sub.copy(&selection) || selection.gyro_device_id == 0) { return; }
+		_calibration.set_device_id(selection.gyro_device_id);
+		_device_id = selection.gyro_device_id;
+	}
+	if (fifo.device_id != _device_id) { return; }
 
 	parameter_update_s parameter_update {};
 	if (_parameter_update_sub.update(&parameter_update)) { parameters_update(); }
@@ -196,8 +195,12 @@ void GPR_Learning::receive_model()
 
 int GPR_Learning::print_status()
 {
+	pthread_mutex_lock(&entry_mutex);
+	const uint32_t device_id = _device_id;
+	pthread_mutex_unlock(&entry_mutex);
+
 	PX4_INFO("gyro device: %" PRIu32 ", learning slot: %u",
-		 _device_id, static_cast<unsigned>(_learning_slot.load(std::memory_order_acquire)));
+		 device_id, static_cast<unsigned>(_learning_slot.load(std::memory_order_acquire)));
 	return 0;
 }
 
@@ -217,7 +220,7 @@ int GPR_Learning::print_usage(const char *reason)
 		"One fixed physical gyro and one background learning task.");
 	PRINT_MODULE_USAGE_NAME("gpr_learning", "estimator");
 	PRINT_MODULE_USAGE_COMMAND("start");
-	PRINT_MODULE_USAGE_PARAM_INT('d', 0, 0, 0, "Physical gyro device id; default is the selection at start", true);
+	PRINT_MODULE_USAGE_PARAM_INT('d', 0, 0, 0, "Physical gyro device id; default binds once selection is available", true);
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 	return 0;
 }

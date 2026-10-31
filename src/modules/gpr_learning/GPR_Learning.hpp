@@ -45,7 +45,7 @@ private:
 	void receive_model();
 	void RunLearning();
 
-	const uint32_t _device_id;
+	uint32_t _device_id;
 	calibration::Gyroscope _calibration;
 	uORB::Subscription _parameter_update_sub {ORB_ID(parameter_update)};
 	DEFINE_PARAMETERS(
