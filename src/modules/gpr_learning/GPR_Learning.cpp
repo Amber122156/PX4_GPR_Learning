@@ -179,16 +179,32 @@ void GPR_Learning::process_fifo(sensor_gyro_fifo_s &fifo)
 void GPR_Learning::RunLearning()
 {
 	if (_learning_slot.load(std::memory_order_acquire) != LearningSlot::Running) { return; }
-	_learning_status = _algorithm.update(_request, _candidate);
+	_update_result = _algorithm.update(_request, _candidate);
 	_learning_slot.store(LearningSlot::Complete, std::memory_order_release);
 }
 
 void GPR_Learning::receive_model()
 {
 	if (_learning_slot.load(std::memory_order_acquire) != LearningSlot::Complete) { return; }
-	if (_learning_status == 0) {
-		_model = _candidate;
-		_algorithm.finish_update(_request, _model);
+	// update() publishes only consistent states, including frequency-only success
+	// or expiry. Failed waveform work never changes its candidate's old waveform.
+	_model = _candidate;
+	_algorithm.finish_update(_request, _model);
+	if (_update_result.frequency_attempted) {
+		++_diagnostics.frequency_attempts;
+		if (_model.fft_accepted) { ++_diagnostics.frequency_accepted; }
+		if (_update_result.frequency_error != 0) {
+			++_diagnostics.frequency_failures;
+			_diagnostics.last_frequency_error = _update_result.frequency_error;
+		}
+	}
+	if (_update_result.training_attempted) {
+		++_diagnostics.training_attempts;
+		if (_update_result.training_error == 0) { ++_diagnostics.training_successes; }
+		else {
+			++_diagnostics.training_failures;
+			_diagnostics.last_training_error = _update_result.training_error;
+		}
 	}
 	_learning_slot.store(LearningSlot::Idle, std::memory_order_release);
 }
@@ -197,10 +213,21 @@ int GPR_Learning::print_status()
 {
 	pthread_mutex_lock(&entry_mutex);
 	const uint32_t device_id = _device_id;
+	const auto diagnostics = _diagnostics;
+	const bool frequency_valid = _model.frequency_valid, model_valid = _model.valid, stale = _model.stale;
+	const double frequency_hz = _model.frequency_hz;
 	pthread_mutex_unlock(&entry_mutex);
 
 	PX4_INFO("gyro device: %" PRIu32 ", learning slot: %u",
 		 device_id, static_cast<unsigned>(_learning_slot.load(std::memory_order_acquire)));
+	PX4_INFO("frequency: %.4f Hz (valid %u), waveform valid %u, stale %u",
+		 frequency_hz, unsigned(frequency_valid), unsigned(model_valid), unsigned(stale));
+	PX4_INFO("FFT attempts/accepted/errors: %" PRIu32 "/%" PRIu32 "/%" PRIu32 ", last error: %d",
+		 diagnostics.frequency_attempts, diagnostics.frequency_accepted, diagnostics.frequency_failures,
+		 diagnostics.last_frequency_error);
+	PX4_INFO("training attempts/success/errors: %" PRIu32 "/%" PRIu32 "/%" PRIu32 ", last error: %d",
+		 diagnostics.training_attempts, diagnostics.training_successes, diagnostics.training_failures,
+		 diagnostics.last_training_error);
 	return 0;
 }
 

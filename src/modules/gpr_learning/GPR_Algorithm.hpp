@@ -101,8 +101,14 @@ public:
 
 	struct HistorySample {
 		uint64_t time_us {};
+		// phase records the coordinate used at acquisition; training remaps accumulated_phase_rad.
 		double raw {}, accumulated_phase_rad {}, phase {}, periodic {};
 		bool phase_valid {}, prediction_valid {};
+	};
+
+	struct UpdateResult {
+		bool frequency_attempted {}, training_attempted {};
+		int frequency_error {}, training_error {};
 	};
 
 	/* 唯一学习槽的固定快照。后台结束且结果接收前，调用者不改写此对象。 */
@@ -136,10 +142,12 @@ public:
 	bool capture_update(const Model &model, UpdateRequest &request);
 
 	/* 单个后台任务处理内部生成的请求，不重新检查输入历史。
+	 * candidate 始终保持一致，可在批次边界提交，包括过期失效和训练失败后的频率结果。
+	 * 训练在独立副本中完成，失败时不发布部分相位校正、聚类中心或权重。
 	 * -EDOM: 样本不足/空簇；-ERANGE: 频带或数值求解失败；
-	 * -ENOSPC: 历史容量无法覆盖所需范围。0 不保证已经完成训练。
+	 * -ENOSPC: 历史容量无法覆盖所需范围。错误按子操作分别返回。
 	 */
-	int update(const UpdateRequest &request, Model &candidate);
+	UpdateResult update(const UpdateRequest &request, Model &candidate);
 
 	/* 成功结果在批次入口接收后调用，保留任务运行期间新增的预测计数。 */
 	void finish_update(const UpdateRequest &request, const Model &model);
@@ -152,7 +160,7 @@ private:
 	int estimate_frequency(const UpdateRequest &request, Model &candidate);
 	int correct_phase(const UpdateRequest &request, Model &candidate);
 	int prepare_training(const UpdateRequest &request, Model &candidate);
-	int update_clusters(const UpdateRequest &request);
+	int update_clusters(const UpdateRequest &request, const Model &model);
 	int compute_cluster_statistics(const UpdateRequest &request);
 	int fit_periodic_model(const UpdateRequest &request, Model &candidate);
 	double sphere_objective(const double *centers) const;
@@ -163,6 +171,7 @@ private:
 
 	const HistorySample &history(size_t i) const { return _history[(_head + MAX_HISTORY - _count + i) % MAX_HISTORY]; }
 	const HistorySample &training(size_t i) const { return _training_history[_training_indices[i]]; }
+	double training_phase(size_t i) const;
 
 	Config _config {};
 	bool _configured {}, _have_input {};
@@ -177,6 +186,7 @@ private:
 	const HistorySample *_training_history {};
 	uint16_t _training_indices[MAX_HISTORY] {}, _labels[MAX_HISTORY] {};
 	size_t _training_count {};
+	double _training_phase_offset {};
 	double _phase_sin[MAX_HISTORY] {}, _phase_cos[MAX_HISTORY] {};
 	double _centers[MAX_CLUSTERS] {}, _means[MAX_CLUSTERS] {}, _noise[MAX_CLUSTERS] {};
 	uint32_t _counts[MAX_CLUSTERS] {};

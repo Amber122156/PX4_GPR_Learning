@@ -278,10 +278,13 @@ int GPR_Algorithm::estimate_frequency(const UpdateRequest &r, Model &m)
 		}
 		if (start_memory) {
 			// 只接收此参考时间之后按在线频率推进得到的相位样本，不回填此前的估频数据。
+			m.valid = false;
+			m.phase_offset_rad = 0;
 			m.memory_start_us = r.end_time_us;
 			m.block_start_accumulated_phase_rad = m.accumulated_phase_rad;
+			m.block_end_us = r.end_time_us;
 		}
-		m.last_good_fft_us = r.end_time_us; m.frequency_valid = true;
+		m.last_good_fft_us = r.end_time_us; m.frequency_valid = true; m.stale = false;
 	}
 	return 0;
 }
@@ -290,13 +293,15 @@ int GPR_Algorithm::prepare_training(const UpdateRequest &r, Model &m)
 {
 	_training_history = r.history;
 	_training_count = 0;
+	_training_phase_offset = m.phase_offset_rad;
 	const double cutoff = m.accumulated_phase_rad - TWO_PI * _config.memory_cycles;
 	for (size_t i = 0; i < r.count; ++i) {
 		const auto &entry = r.history[i];
 		if (entry.time_us > m.memory_start_us && entry.phase_valid && entry.accumulated_phase_rad >= cutoff) {
 			_training_indices[_training_count] = uint16_t(i);
-			_phase_sin[_training_count] = std::sin(entry.phase);
-			_phase_cos[_training_count] = std::cos(entry.phase);
+			const double phase = training_phase(_training_count);
+			_phase_sin[_training_count] = std::sin(phase);
+			_phase_cos[_training_count] = std::cos(phase);
 			++_training_count;
 		}
 	}
@@ -307,55 +312,81 @@ int GPR_Algorithm::prepare_training(const UpdateRequest &r, Model &m)
 	return _training_count >= _config.cluster_count ? 0 : -EDOM;
 }
 
-int GPR_Algorithm::update(const UpdateRequest &r, Model &candidate)
+double GPR_Algorithm::training_phase(size_t i) const
+{
+	return wrap(training(i).accumulated_phase_rad + _training_phase_offset);
+}
+
+GPR_Algorithm::UpdateResult GPR_Algorithm::update(const UpdateRequest &r, Model &candidate)
 {
 	// 请求由采样路径构造且独占，不再次检查输入字段、历史数值或时间顺序。
+	UpdateResult result {};
 	candidate = r.base_model;
 	candidate.generation = r.generation;
-	candidate.fft_attempted = candidate.fft_accepted = candidate.model_updated = false;
+	candidate.fft_attempted = r.frequency;
+	candidate.fft_accepted = candidate.model_updated = false;
 	candidate.correction = {};
 	if (candidate.frequency_valid) {
 		candidate.accumulated_phase_rad += TWO_PI * candidate.frequency_hz * seconds(r.end_time_us, candidate.reference_time_us);
+		// Check the old observation age before a successful FFT can refresh it.
+		candidate.stale = candidate.stale
+			|| seconds(r.end_time_us, candidate.last_good_fft_us) > _config.max_frequency_stale_s;
+		if (candidate.stale) { candidate.valid = false; }
 	}
 	candidate.reference_time_us = r.end_time_us;
-	if (r.frequency) { const int ret = estimate_frequency(r, candidate); if (ret != 0) { return ret; } }
-	if (!candidate.frequency_valid) { return 0; }
-	candidate.stale = seconds(r.end_time_us, candidate.last_good_fft_us) > _config.max_frequency_stale_s;
-	if (candidate.stale) { candidate.valid = false; return 0; }
-	if (!r.train) { return 0; }
+	if (r.frequency) {
+		result.frequency_attempted = true;
+		result.frequency_error = estimate_frequency(r, candidate);
+		if (result.frequency_error != 0) { return result; }
+	}
+	if (!candidate.frequency_valid || candidate.stale || !r.train
+	    || candidate.memory_start_us == r.end_time_us) { return result; }
 
-	int ret = prepare_training(r, candidate);
-	if (ret != 0) { return ret; }
-	const bool initial = !candidate.valid;
-	if (!initial) { ret = correct_phase(r, candidate); if (ret != 0) { return ret; } }
-	ret = update_clusters(r); if (ret != 0) { return ret; }
-	ret = compute_cluster_statistics(r); if (ret != 0) { return ret; }
-	ret = fit_periodic_model(r, candidate); if (ret != 0) { return ret; }
-	candidate.block_start_accumulated_phase_rad = initial ? candidate.accumulated_phase_rad : candidate.block_start_accumulated_phase_rad + TWO_PI;
-	candidate.block_end_us = r.end_time_us;
-	return 0;
+	// Keep the frequency-only candidate intact until every waveform operation succeeds.
+	Model trained = candidate;
+	result.training_attempted = true;
+	int ret = trained.valid ? correct_phase(r, trained) : 0;
+	if (ret == 0) { ret = prepare_training(r, trained); }
+	if (ret == 0) { ret = update_clusters(r, trained); }
+	if (ret == 0) { ret = compute_cluster_statistics(r); }
+	if (ret == 0) { ret = fit_periodic_model(r, trained); }
+	result.training_error = ret;
+	if (ret != 0) { return result; }
+	// Coalesce overdue periods: both boundaries describe the actual processed endpoint.
+	trained.block_start_accumulated_phase_rad = trained.accumulated_phase_rad;
+	trained.block_end_us = r.end_time_us;
+	candidate = trained;
+	return result;
 }
 
 int GPR_Algorithm::correct_phase(const UpdateRequest &r, Model &m)
 {
-	// 仅对已完成周期中的原始测量和当时实际输出的预测做相关，不能用新模型重算历史预测。
-	size_t count = 0;
-	for (size_t i = 0; i < r.count; ++i) {
-		if (r.history[i].time_us > r.base_model.block_end_us && r.history[i].prediction_valid) { _scratch[count++] = double(i); }
+	// Correlate the latest complete phase cycle with the predictions actually applied then.
+	if (r.count < 2) { return -EDOM; }
+	const size_t end = r.count - 1;
+	const auto &last = r.history[end];
+	if (!last.phase_valid || !last.prediction_valid) { return -EDOM; }
+	const double start_phase = last.accumulated_phase_rad - TWO_PI;
+	if (start_phase < r.base_model.block_start_accumulated_phase_rad - 1e-8) { return -EDOM; }
+	size_t first = end;
+	while (first > 0 && r.history[first].accumulated_phase_rad > start_phase) { --first; }
+	if (r.history[first].accumulated_phase_rad > start_phase + 1e-8) {
+		return r.history_truncated ? -ENOSPC : -EDOM;
 	}
-	if (count < _config.min_correction_samples) { return -EDOM; }
-	if (r.history_truncated && r.history[0].time_us > r.base_model.block_end_us) { return -ENOSPC; }
-	const auto &first = r.history[size_t(_scratch[0])], &last = r.history[size_t(_scratch[count - 1])];
+	if (end - first + 1 < _config.min_correction_samples) { return -EDOM; }
+	for (size_t i = first; i <= end; ++i) {
+		if (!r.history[i].phase_valid || !r.history[i].prediction_valid) { return -EDOM; }
+	}
 	const size_t grid = _config.correlation_samples;
 	double mean_a = 0, mean_b = 0;
-	size_t right = 1;
-	const double duration = seconds(last.time_us, first.time_us);
-	// 两路数据插值到相同的等时间网格，末端不重复取样，便于进行圆周平移。
+	size_t right = first + 1;
+	// Equal phase spacing also handles frequency changes; the 2π endpoint is not duplicated.
 	for (size_t i = 0; i < grid; ++i) {
-		const double u = duration * i / grid;
-		while (right + 1 < count && seconds(r.history[size_t(_scratch[right])].time_us, first.time_us) < u) { ++right; }
-		const auto &a = r.history[size_t(_scratch[right - 1])], &b = r.history[size_t(_scratch[right])];
-		const double alpha = (u - seconds(a.time_us, first.time_us)) / seconds(b.time_us, a.time_us);
+		const double phase = start_phase + TWO_PI * i / grid;
+		while (right < end && r.history[right].accumulated_phase_rad < phase) { ++right; }
+		const auto &a = r.history[right - 1], &b = r.history[right];
+		const double alpha = clamp((phase - a.accumulated_phase_rad)
+					   / (b.accumulated_phase_rad - a.accumulated_phase_rad), 0, 1);
 		_corr_raw[i] = a.raw + alpha * (b.raw - a.raw);
 		_corr_pred[i] = a.periodic + alpha * (b.periodic - a.periodic);
 		mean_a += _corr_raw[i]; mean_b += _corr_pred[i];
@@ -404,12 +435,12 @@ int GPR_Algorithm::correct_phase(const UpdateRequest &r, Model &m)
 
 double GPR_Algorithm::sphere_objective(const double *centers) const
 {
-	// 单纯形候选可以超出一周；每次评价仅规范中心，样本相位已在入库时规范。
+	// 单纯形候选可以超出一周；样本与中心均使用当前训练坐标。
 	double normalized[MAX_CLUSTERS] {};
 	for (size_t j = 0; j < _config.cluster_count; ++j) { normalized[j] = wrap(centers[j]); }
 	double result = 0;
 	for (size_t i = 0; i < _training_count; ++i) {
-		const double phase = training(i).phase;
+		const double phase = training_phase(i);
 		double nearest = PI;
 		for (size_t j = 0; j < _config.cluster_count; ++j) {
 			const double distance = std::abs(phase - normalized[j]);
@@ -425,7 +456,7 @@ void GPR_Algorithm::assign_clusters(const double *centers)
 {
 	// 半角余弦代价随最短角距单调增加；直接比较角距，平局保留较小编号。
 	for (size_t i = 0; i < _training_count; ++i) {
-		const double phase = training(i).phase;
+		const double phase = training_phase(i);
 		double nearest = TWO_PI;
 		for (size_t j = 0; j < _config.cluster_count; ++j) {
 			const double distance = std::abs(phase - centers[j]);
@@ -531,7 +562,7 @@ void GPR_Algorithm::lloyd()
 				// 空簇不能提供观测统计，将其中心放到当前覆盖最差的样本处。
 				double farthest = -1; size_t selected = 0;
 				for (size_t i = 0; i < _training_count; ++i) {
-					const double phase = training(i).phase;
+					const double phase = training_phase(i);
 					double nearest = TWO_PI;
 					for (size_t c = 0; c < _config.cluster_count; ++c) {
 						const double distance = std::abs(phase - _centers[c]);
@@ -539,7 +570,7 @@ void GPR_Algorithm::lloyd()
 					}
 					if (nearest > farthest) { farthest = nearest; selected = i; }
 				}
-				_centers[j] = training(selected).phase;
+				_centers[j] = training_phase(selected);
 			}
 		}
 		double moved = 0;
@@ -551,14 +582,15 @@ void GPR_Algorithm::lloyd()
 	}
 }
 
-int GPR_Algorithm::update_clusters(const UpdateRequest &r)
+int GPR_Algorithm::update_clusters(const UpdateRequest &r, const Model &m)
 {
 	const size_t k = _config.cluster_count;
-	_reclustered = !r.base_model.valid;
+	_reclustered = !m.valid;
 	if (_reclustered) { optimize_centers(); lloyd(); }
 	else {
 		// 在线阶段先沿用已有中心分配样本，只做一次圆周均值更新，减少重复求解。
-		std::copy(r.base_model.centers, r.base_model.centers + k, _centers);
+		const double shift = m.phase_offset_rad - r.base_model.phase_offset_rad;
+		for (size_t j = 0; j < k; ++j) { _centers[j] = wrap(r.base_model.centers[j] + shift); }
 		assign_clusters(_centers);
 		double sum_sin[MAX_CLUSTERS] {}, sum_cos[MAX_CLUSTERS] {};
 		std::fill(_counts, _counts + k, 0);

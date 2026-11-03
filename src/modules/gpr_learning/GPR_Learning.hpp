@@ -60,5 +60,11 @@ private:
 	GPR_Algorithm _algorithm;
 	GPR_Algorithm::UpdateRequest _request {};
 	GPR_Algorithm::Model _candidate {}, _model {};
-	int _learning_status {};
+	GPR_Algorithm::UpdateResult _update_result {};
+	// Updated at batch boundaries and read by status under the entry mutex.
+	struct Diagnostics {
+		uint32_t frequency_attempts {}, frequency_accepted {}, frequency_failures {};
+		uint32_t training_attempts {}, training_successes {}, training_failures {};
+		int last_frequency_error {}, last_training_error {};
+	} _diagnostics;
 };
